@@ -1,7 +1,5 @@
 import numpy as np
 import torch
-import librosa
-# import comfy.model_management
 import folder_paths
 import os
 import sys
@@ -23,6 +21,8 @@ config_path = os.path.join(model_path, "Dia-1.6B", "config.json")
 checkpoint_path = os.path.join(model_path, "Dia-1.6B")
 dac_model_path = os.path.join(model_path, "DAC.speech.v1.0", "weights_44khz_8kbps_0.0.1.pth")
 cache_dir = folder_paths.get_temp_directory()
+speakers_path = os.path.join(model_path, "speakers", "dialogue_speakers")
+
 
 def cache_audio_tensor(
     cache_dir,
@@ -46,6 +46,84 @@ def cache_audio_tensor(
     except Exception as e:
         raise Exception(f"Error caching audio tensor: {e}")
 
+
+def concatenate(audio_a, audio_b):
+    """
+    Concatenates two audio waveforms after resampling and smart channel adjustment.
+
+    Args:
+        audio_a (dict): First audio input {"waveform": tensor, "sample_rate": int}.
+        audio_b (dict): Second audio input {"waveform": tensor, "sample_rate": int}.
+
+    Returns:
+        tuple: A tuple containing the output audio dictionary.
+                ({"waveform": concatenated_tensor, "sample_rate": max_sr},)
+    """
+    waveform_a = audio_a["waveform"]
+    sr_a = audio_a["sample_rate"]
+    waveform_b = audio_b["waveform"]
+    sr_b = audio_b["sample_rate"]
+
+    final_sr = max(sr_a, sr_b)
+
+    resampled_waveform_a = waveform_a
+    if sr_a != final_sr:
+        print(f"Concatenate Audio Node: Resampling audio A from {sr_a} Hz to {final_sr} Hz")
+        resample_a = torchaudio.transforms.Resample(orig_freq=sr_a, new_freq=final_sr).to(waveform_a.device)
+        resampled_waveform_a = resample_a(waveform_a)
+
+    resampled_waveform_b = waveform_b
+    if sr_b != final_sr:
+        print(f"Concatenate Audio Node: Resampling audio B from {sr_b} Hz to {final_sr} Hz")
+        resample_b = torchaudio.transforms.Resample(orig_freq=sr_b, new_freq=final_sr).to(waveform_b.device)
+        resampled_waveform_b = resample_b(waveform_b)
+
+    channels_a = resampled_waveform_a.shape[1]
+    channels_b = resampled_waveform_b.shape[1]
+
+    if channels_a == 1 and channels_b == 1:
+        target_channels = 1 
+        print("Concatenate Audio Node: Both inputs are mono, output will be mono (1 channel).")
+    else:
+        target_channels = 2 
+        print(f"Concatenate Audio Node: At least one input is not mono ({channels_a} vs {channels_b}), output will be stereo (2 channels).")
+
+    def adjust_channels(wf, current_channels, target_channels, name):
+        if current_channels == target_channels:
+            return wf
+        elif target_channels == 1 and current_channels > 1:
+
+                print(f"Concatenate Audio Node Warning: Attempting to downmix {name} from {current_channels} to {target_channels} (mono). Simple average downmix applied.")
+
+                return wf.mean(dim=1, keepdim=True)
+        elif target_channels == 2:
+            if current_channels == 1:
+
+                print(f"Concatenate Audio Node: Converting {name} from {current_channels} to {target_channels} channels (mono to stereo).")
+                return wf.repeat(1, target_channels, 1) 
+            elif current_channels > 2:
+
+                print(f"Concatenate Audio Node Warning: Converting {name} from {current_channels} to {target_channels} channels (multi-channel to stereo). Applying simple average downmix.")
+
+                mono_wf = wf.mean(dim=1, keepdim=True)
+                return mono_wf.repeat(1, target_channels, 1)
+
+        else:
+
+                raise RuntimeError(f"Concatenate Audio Node: Unsupported channel adjustment requested for {name}: from {current_channels} to {target_channels}.")
+
+    adjusted_waveform_a = adjust_channels(resampled_waveform_a, channels_a, target_channels, "Audio A")
+    adjusted_waveform_b = adjust_channels(resampled_waveform_b, channels_b, target_channels, "Audio B")
+
+    concatenated_waveform = torch.cat((adjusted_waveform_a, adjusted_waveform_b), dim=2)
+
+    output_audio = {
+        "waveform": concatenated_waveform,
+        "sample_rate": final_sr 
+    }
+
+    return output_audio
+
 MODEL_CACHE = None
 class DiaTTSRun:
     def __init__(self):
@@ -63,7 +141,12 @@ class DiaTTSRun:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "text_input": ("STRING", {"forceInput": True}),
+                "text": ("STRING", {"forceInput": True}),
+                "prompt": ("STRING",  {
+                    "multiline": True, 
+                    "default": ""}),
+                "audio_s1": ("AUDIO",),
+                "audio_s2": ("AUDIO",),
                 "max_new_tokens": ("INT", {"default": 3000, "min": 860, "max": 3072, "step": 2}),
                 "cfg_scale": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 5.0, "step": 0.1}),
                 "temperature": ("FLOAT", {"default": 1.3, "min": 1.0, "max": 1.5, "step": 0.05}),
@@ -74,10 +157,8 @@ class DiaTTSRun:
                 "unload_model": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "speakers_audio_input": ("AUDIO",),
-                "speakers_text_input": ("STRING", {"multiline": True, "default": ""}),
                 "save_speakers": ("BOOLEAN", {"default": True}),
-                "speaker_id": ("STRING", {"default": "A_and_B"}),
+                "speakers_id": ("STRING", {"default": "A_and_B"}),
             },
         }
 
@@ -88,66 +169,74 @@ class DiaTTSRun:
 
     def run_inference(
         self,
-        text_input: str,
+        text: str, 
+        prompt: str,
+        audio_s1: dict,
+        audio_s2: dict,
         max_new_tokens: int,
         cfg_scale: float,
         temperature: float,
         top_p: float,
         cfg_filter_top_k: int,
         # speed_factor: float,
+        # use_torch_compile: bool,
         unload_model: bool,
-        use_torch_compile=False,
-        speakers_audio_input=None,
-        speakers_text_input="",
-        save_speakers=False,
-        speaker_id="A_and_B",
+        save_speakers: bool,
+        speakers_id: str,
     ):
         global MODEL_CACHE
         if MODEL_CACHE is None:
-            model_path = os.path.join(checkpoint_path, "dia-v0_1.pth")
-            MODEL_CACHE = Dia.from_local(config_path, model_path, compute_dtype="float16", device=self.device, dac_model_path=dac_model_path)
+            dia_model_path = os.path.join(checkpoint_path, "dia-v0_1.pth")
+            MODEL_CACHE = Dia.from_local(config_path, dia_model_path, compute_dtype="float16", device=self.device, dac_model_path=dac_model_path)
 
-        text = re.split(r'\n\s*\n', text_input.strip())
-        # print(f"Input text: {text}")
-        if speakers_audio_input is None:
-            audio_prompts = None
-        else:
-            if speakers_text_input.strip() == "":
-                raise ValueError("Text clone input is empty.")
-            audio_data = speakers_audio_input["waveform"].squeeze(0)
-            sr = speakers_audio_input["sample_rate"]
+        if text.strip() == "" or prompt.strip() == "":
+            raise ValueError("Text or prompt input is empty.")
 
-            speakers_path = os.path.join(checkpoint_path, "speakers")
+        texts = [i.strip() for i in re.split(r'\n\s*\n', text.strip()) if i.strip()]
+
+        speakers_audio_input = concatenate(audio_s1, audio_s2)
+        audio_data = speakers_audio_input["waveform"].squeeze(0)
+        sr = speakers_audio_input["sample_rate"]
+
+        if save_speakers:
+            if speakers_id.strip() == "":
+                raise ValueError("Speakers ID is empty.")
+
             if not os.path.exists(speakers_path):
                 os.makedirs(speakers_path)
 
-            if save_speakers:
-                audio_path = os.path.join(speakers_path, f"{speaker_id}.wav")
-                text_path = os.path.join(speakers_path, f"{speaker_id}.txt")
-                torchaudio.save(audio_path, audio_data, sr)
-                with open(text_path, "w", encoding="utf-8") as f:
-                    f.write(speakers_text_input.strip())
-            else:
-                audio_path = cache_audio_tensor(
-                    cache_dir,
-                    audio_data,
-                    sr,
-                )
+            audio_s1_path = os.path.join(speakers_path, f"{speakers_id}_1.wav")
+            torchaudio.save(audio_s1_path, audio_s1["waveform"].squeeze(0), audio_s1["sample_rate"])
 
-            audio_prompt = MODEL_CACHE.load_audio(audio_path)
-            text = [speakers_text_input.strip() + f"\n{i}" for i in text]
-            audio_prompts = [audio_prompt for i in range(len(text))]
+            audio_s2_path = os.path.join(speakers_path, f"{speakers_id}_2.wav")
+            torchaudio.save(audio_s2_path, audio_s2["waveform"].squeeze(0), audio_s2["sample_rate"])
+
+            text_path = os.path.join(speakers_path, f"{speakers_id}.txt")
+            
+            with open(text_path, "w", encoding="utf-8") as f:
+                f.write(prompt)
+
+        audio_path = cache_audio_tensor(
+                                        cache_dir,
+                                        audio_data,
+                                        sr,
+                                    )
+
+        audio_prompt = MODEL_CACHE.load_audio(audio_path)
+
+        text_gens = [prompt.strip() + f"\n{i}" for i in texts]
+        audio_prompts = [audio_prompt for i in range(len(texts))]
 
         # Use torch.inference_mode() context manager for the generation call
         with torch.inference_mode():
             output_audio_np = MODEL_CACHE.generate(
-                text=text,
+                text=text_gens,
                 max_tokens=max_new_tokens,
                 cfg_scale=cfg_scale,
                 temperature=temperature,
                 top_p=top_p,
                 cfg_filter_top_k=cfg_filter_top_k,
-                use_torch_compile=use_torch_compile, 
+                use_torch_compile=False, 
                 audio_prompt=audio_prompts,
                 verbose=True,
             )
@@ -229,36 +318,46 @@ def get_speakers():
     if not os.path.exists(speakers_dir):
         os.makedirs(speakers_dir, exist_ok=True)
         return []
-    speakers = get_all_files(speakers_dir, extensions=[".wav"], relative_path=True)
+    speakers = get_all_files(speakers_dir, extensions=[".txt"], relative_path=True)
     return speakers
+
 
 class DiaSpeakersPreview:
     def __init__(self):
-        self.speakers_dir = os.path.join(checkpoint_path, "speakers")
+        self.speakers_dir = speakers_path
     @classmethod
     def INPUT_TYPES(s):
         speakers = get_speakers()
         return {
             "required": {"speaker":(speakers,),},}
 
-    RETURN_TYPES = ("AUDIO", "STRING",)
-    RETURN_NAMES = ("audio", "text",)
+    RETURN_TYPES = ("STRING", "AUDIO", "AUDIO",)
+    RETURN_NAMES = ("prompt", "audio_s1", "audio_s2",)
     FUNCTION = "preview"
     CATEGORY = "🎤MW/MW-Dia"
 
     def preview(self, speaker):
-        wav_path = os.path.join(self.speakers_dir, speaker)
-        waveform, sample_rate = torchaudio.load(wav_path)
+        text_path = os.path.join(self.speakers_dir, speaker)
+        with open(text_path, "r", encoding="utf-8") as f:
+            text = f.read()
+
+        audio_s1_path = text_path.replace(".txt", "_1.wav")
+        waveform, sample_rate = torchaudio.load(audio_s1_path)
         waveform = waveform.unsqueeze(0)
-        output_audio = {
+        output_audio_s1 = {
             "waveform": waveform,
             "sample_rate": sample_rate
         }
 
-        with open(wav_path.replace(".wav", ".txt"), "r", encoding="utf-8") as f:
-            text = f.read()
+        audio_s2_path = text_path.replace(".txt", "_2.wav")
+        waveform, sample_rate = torchaudio.load(audio_s2_path)
+        waveform = waveform.unsqueeze(0)
+        output_audio_s2 = {
+            "waveform": waveform,
+            "sample_rate": sample_rate
+        }
 
-        return (output_audio, text,)
+        return (text, output_audio_s1, output_audio_s2)
 
 
 NODE_CLASS_MAPPINGS = {
